@@ -11,6 +11,10 @@ from models.Kinematics import ForwardKinematics
 from models.skeleton import build_edge_topology
 from option_parser import get_std_bvh
 from datasets.bvh_writer import write_bvh
+from datasets.godot_reference_poses import (
+    apply_bone_roll,
+    apply_complete_bone_roll_transformation
+)
 
 """
 1.
@@ -157,6 +161,64 @@ corps_names = {
         "RightLowerArm",
         "RightHand",
     ],
+    "godot_humanoid": [
+        "Root",
+        "Hips",
+        "Spine",
+        "Chest",
+        "UpperChest",
+        "Neck",
+        "Head",
+        "LeftEye",
+        "RightEye",
+        "Jaw",
+        "LeftShoulder",
+        "LeftUpperArm",
+        "LeftLowerArm",
+        "LeftHand",
+        "LeftThumbMetacarpal",
+        "LeftThumbProximal",
+        "LeftThumbDistal",
+        "LeftIndexProximal",
+        "LeftIndexIntermediate",
+        "LeftIndexDistal",
+        "LeftMiddleProximal",
+        "LeftMiddleIntermediate",
+        "LeftMiddleDistal",
+        "LeftRingProximal",
+        "LeftRingIntermediate",
+        "LeftRingDistal",
+        "LeftLittleProximal",
+        "LeftLittleIntermediate",
+        "LeftLittleDistal",
+        "RightShoulder",
+        "RightUpperArm",
+        "RightLowerArm",
+        "RightHand",
+        "RightThumbMetacarpal",
+        "RightThumbProximal",
+        "RightThumbDistal",
+        "RightIndexProximal",
+        "RightIndexIntermediate",
+        "RightIndexDistal",
+        "RightMiddleProximal",
+        "RightMiddleIntermediate",
+        "RightMiddleDistal",
+        "RightRingProximal",
+        "RightRingIntermediate",
+        "RightRingDistal",
+        "RightLittleProximal",
+        "RightLittleIntermediate",
+        "RightLittleDistal",
+        "LeftUpperLeg",
+        "LeftLowerLeg",
+        "LeftFoot",
+        "LeftToes",
+        "RightUpperLeg",
+        "RightLowerLeg",
+        "RightFoot",
+        "RightToes",
+    ],
     # "corps_motion_project": [
     #     "Hips",
     #     "LeftUpLeg",
@@ -237,6 +299,21 @@ ee_names = {
     # "corps_BerkeleyMHAD": ["LeftFoot", "RightFoot", "Head", "LeftHand", "RightHand",],
     "corps_VRM": ["leftToes", "rightToes", "head", "leftHand", "rightHand",],
     "corps_VRM_1": ["LeftToes", "RightToes", "Head", "LeftHand", "RightHand",],
+    "godot_humanoid": [
+        "LeftToes",
+        "RightToes",
+        "Head",
+        "LeftThumbDistal",
+        "LeftIndexDistal",
+        "LeftMiddleDistal",
+        "LeftRingDistal",
+        "LeftLittleDistal",
+        "RightThumbDistal",
+        "RightIndexDistal",
+        "RightMiddleDistal",
+        "RightRingDistal",
+        "RightLittleDistal",
+    ],
     # "corps_motion_project": [
     #     "LeftToeBase",
     #     "RightToeBase",
@@ -281,7 +358,9 @@ class BVH_file:
                     full_fill[i] = 0
                     break
 
-        if "leftLowerLeg" in self._names:
+        if "LeftThumbMetacarpal" in self._names and "Root" in self._names:
+            self.skeleton_type = "godot_humanoid"
+        elif "leftLowerLeg" in self._names:
             self.skeleton_type = "corps_VRM"
         elif "LeftLowerLeg" in self._names:
             self.skeleton_type = "corps_VRM_1"
@@ -410,20 +489,63 @@ class BVH_file:
     def get_ee_id(self):
         return self.ee_id
 
-    def to_numpy(self, quater=False, edge=True):
+    def to_numpy(self, quater=False, edge=True, use_6d=False):
+        """
+        Convert animation data to numpy array.
+        
+        Args:
+            quater: If True, use quaternion representation (4 params per bone)
+            edge: If True, filter to edge bones only
+            use_6d: If True, use 6D rotation representation with COMPLETE bone roll correction (Godot Humanoid only)
+                    This applies Godot's full rest fixer algorithm:
+                    - Transforms rotations to match Godot reference poses
+                    - Transforms skeleton offsets using accumulated rotation diffs
+                    - Transforms animation data to match new rest poses
+        
+        Returns:
+            numpy array of shape (num_frames, num_params)
+            - Standard mode: (num_frames, num_bones*3 + 3) for Euler angles
+            - Quater mode: (num_frames, num_bones*4 + 3) for quaternions
+            - 6D mode: (num_frames, num_bones*6 + 3) for 6D representation
+        """
         rotations = self.anim.rotations[:, self.corps, :]
-        if quater:
+        
+        # Apply complete 6D bone roll transformation for Godot Humanoid
+        if use_6d and self.skeleton_type == "godot_humanoid":
+            # Get skeleton structure
+            offsets = self.offset  # (num_bones, 3)
+            topology = np.array(self.topology)  # (num_bones,) parent indices
+            
+            # Apply complete bone roll transformation (rotations + offsets + animations)
+            # This implements Godot's rest fixer algorithm
+            rotations_6d, transformed_offsets = apply_complete_bone_roll_transformation(
+                rotations=rotations,  # (num_frames, num_bones, 3)
+                offsets=offsets,      # (num_bones, 3)
+                topology=topology,    # (num_bones,)
+                bone_names=self.simplified_name,
+                order='xyz'
+            )
+            
+            # Update the skeleton's offsets to match transformed skeleton
+            # Note: This modifies self.anim.offsets in-place for the corps bones
+            for i, bone_idx in enumerate(self.corps):
+                self.anim.offsets[bone_idx] = transformed_offsets[i]
+            
+            # Reshape rotations: (num_frames, num_bones, 6) -> (num_frames, num_bones*6)
+            rotations = rotations_6d.reshape(rotations_6d.shape[0], -1)
+            positions = self.anim.positions[:, 0, :]
+            
+        elif quater:
             rotations = Quaternions.from_euler(np.radians(rotations)).qs
             positions = self.anim.positions[:, 0, :]
         else:
             positions = self.anim.positions[:, 0, :]
-        if edge:
-            index = []
-            for e in self.edges:
-                index.append(e[0])
-            rotations = rotations[:, index, :]
-
-        rotations = rotations.reshape(rotations.shape[0], -1)
+            if edge:
+                index = []
+                for e in self.edges:
+                    index.append(e[0])
+                rotations = rotations[:, index, :]
+            rotations = rotations.reshape(rotations.shape[0], -1)
 
         return np.concatenate((rotations, positions), axis=1)
 
